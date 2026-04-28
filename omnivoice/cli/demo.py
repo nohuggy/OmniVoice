@@ -186,7 +186,7 @@ def build_demo(
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
-            guidance_scale=float(guidance_scale) if guidance_scale is not None else 2.0,
+            guidance_scale=float(guidance_scale) if guidance_scale is not None else 0.5,
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
@@ -256,7 +256,7 @@ def build_demo(
             sp = gr.Slider(
                 0.5,
                 1.5,
-                value=1.0,
+                value=0.9,
                 step=0.05,
                 label="Speed",
                 info="1.0 = normal. >1 faster, <1 slower. Ignored if Duration is set.",
@@ -284,11 +284,11 @@ def build_demo(
             )
             gs = gr.Slider(
                 0.0,
-                4.0,
-                value=2.0,
+                5.0,
+                value=0.5,
                 step=0.1,
                 label="Guidance Scale (CFG)",
-                info="Default: 2.0.",
+                info="Default: 0.5.",
             )
             pp = gr.Checkbox(
                 label="Preprocess Prompt",
