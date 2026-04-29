@@ -25,14 +25,219 @@ Usage:
 
 import argparse
 import logging
+import os
+import re
+import tempfile
+import zipfile
 from typing import Any, Dict
 
 import gradio as gr
 import numpy as np
+import soundfile as sf
 import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
+
+
+def smart_split(text, language="eng"):
+    """
+    Split text into smaller chunks based on language rules.
+    Balances line lengths and ensures punctuation is attached to the previous line.
+    English: 10±4 words
+    CJK: 14±4 characters
+    """
+    if not text:
+        return []
+
+    # Clean text: remove multiple newlines and whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    lang_lower = language.lower() if language else "eng"
+
+    # Punctuation that should not start a line
+    FORBIDDEN_START = "，。！？、）】》”’；：,.!?;:)]}>"
+
+    def split_into_balanced_chunks(items, max_val, soft_limit, join_str=""):
+        if not items:
+            return []
+        total = len(items)
+        if total <= soft_limit:
+            return [join_str.join(items)]
+        
+        # Calculate number of chunks needed
+        num_chunks = (total + max_val - 1) // max_val
+        target = total // num_chunks
+        
+        # Try to find punctuation within tolerance range (target ± 4)
+        best_split = -1
+        PUNCT_SPLIT = "，。！？、；：,.!?;:"
+        
+        search_start = max(1, target - 4)
+        search_end = min(total - 1, target + 4)
+        
+        # Search from right to left to maximize the first chunk within limits
+        for j in range(search_end, search_start - 1, -1):
+            char_or_word = items[j-1]
+            if char_or_word[-1] in PUNCT_SPLIT:
+                best_split = j
+                break
+        
+        # Fallback to balanced split if no punctuation found
+        if best_split == -1:
+            best_split = target
+            
+        first = join_str.join(items[:best_split])
+        remaining = items[best_split:]
+        return [first] + split_into_balanced_chunks(remaining, max_val, soft_limit, join_str)
+
+    def finalize_chunks(chunks):
+        if not chunks:
+            return []
+        processed = [chunks[0]]
+        for i in range(1, len(chunks)):
+            current = chunks[i].strip()
+            if not current:
+                continue
+            
+            # Pull up leading punctuation to the previous chunk
+            while current and (current[0] in FORBIDDEN_START or current[0] == "…"):
+                punct = current[0]
+                processed[-1] += punct
+                current = current[1:].strip()
+            
+            if current:
+                processed.append(current)
+        return processed
+
+    if lang_lower in ["eng", "en", "auto"]:
+        # 10±4 words
+        max_val, soft_limit = 10, 14
+        sentences = re.split(r"(?<=[.!?]) +", text)
+        all_chunks = []
+        for s in sentences:
+            words = s.split()
+            all_chunks.extend(split_into_balanced_chunks(words, max_val, soft_limit, " "))
+        return finalize_chunks(all_chunks)
+
+    # CJK (Chinese, Japanese, Korean)
+    elif lang_lower in ["cmn", "zh", "jpn", "ja", "kor", "ko"]:
+        # 14±4 characters
+        max_val, soft_limit = 14, 18
+        sentences = re.split(r"(?<=[。！？])", text)
+        all_chunks = []
+        for s in sentences:
+            s = s.strip()
+            if not s: continue
+            all_chunks.extend(split_into_balanced_chunks(list(s), max_val, soft_limit, ""))
+        return finalize_chunks(all_chunks)
+
+    # Default fallback for other languages
+    else:
+        # Generic word-based split if space exists, otherwise char-based
+        if " " in text:
+            return finalize_chunks(split_into_balanced_chunks(text.split(), 10, 14, " "))
+        else:
+            return finalize_chunks(split_into_balanced_chunks(list(text), 14, 18, ""))
+
+
+def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
+    """Generate SRT using forced alignment with the exact input text"""
+    if not text or audio_tuple is None:
+        return "No text or audio to align."
+
+    sr, waveform = audio_tuple
+
+    # Save audio temporarily as WAV (aeneas prefers WAV)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_audio:
+        # waveform is usually int16 here based on _gen_core
+        sf.write(f_audio.name, waveform.astype(np.float32) / 32767.0, sr)
+        audio_path = f_audio.name
+
+    # Prepare output SRT path
+    fd, srt_path = tempfile.mkstemp(suffix=".srt")
+    os.close(fd)
+
+    # Map common codes to aeneas 3-letter codes
+    lang_map = {
+        "en": "eng",
+        "english": "eng",
+        "zh": "cmn",
+        "chinese": "cmn",
+        "mandarin": "cmn",
+        "ja": "jpn",
+        "japanese": "jpn",
+        "ko": "kor",
+        "korean": "kor",
+    }
+    aeneas_lang = lang_map.get(
+        language.lower() if language else "eng",
+        (language.lower()[:3] if language and len(language) >= 3 else "eng"),
+    )
+
+    # Smart Split the text
+    segments = smart_split(text, language)
+    if not segments:
+        return "No text segments to align."
+
+    # Prepare text file for aeneas (one segment per line)
+    with tempfile.NamedTemporaryFile(
+        suffix=".txt", delete=False, mode="w", encoding="utf-8"
+    ) as f_text:
+        f_text.write("\n".join(segments))
+        text_path = f_text.name
+
+    try:
+        from aeneas.executetask import ExecuteTask
+        from aeneas.task import Task
+
+        config_string = (
+            f"task_language={aeneas_lang}|is_text_type=plain|os_task_file_format=srt|"
+            "task_adjust_boundary_nonspeech_tolerance=0.2|task_adjust_boundary_threshold=0.1"
+        )
+        task = Task(config_string=config_string)
+        task.audio_file_path_absolute = audio_path
+        task.text_file_path_absolute = text_path
+        task.sync_map_file_path_absolute = srt_path
+
+        # Run forced alignment
+        ExecuteTask(task).execute()
+        task.output_sync_map_file()
+
+        with open(srt_path, "r", encoding="utf-8") as f:
+            srt_content = f.read()
+
+        return srt_content.strip()
+
+    except Exception as e:
+        return f"Alignment error: {str(e)}\n\nFalling back to plain text:\n{text}"
+
+    finally:
+        # Cleanup temp files
+        for path in [audio_path, text_path, srt_path]:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+def get_slug(text, max_tokens=8):
+    """Generate a filename-safe slug from the first few words/characters."""
+    # Remove punctuation and special characters, keep letters, numbers and CJK
+    clean_text = re.sub(r"[^\w\s\u4e00-\u9fff]", "", text)
+    # Tokenize: CJK characters or English words
+    tokens = re.findall(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+", clean_text)
+    selected = tokens[:max_tokens]
+    if not selected:
+        return "output"
+
+    # Join tokens with space if they are English words, or keep together for CJK
+    res = selected[0]
+    for i in range(1, len(selected)):
+        prev, curr = selected[i - 1], selected[i]
+        # Add space if either is English/Number, or between English and CJK
+        if re.match(r"[a-zA-Z0-9]", prev) or re.match(r"[a-zA-Z0-9]", curr):
+            res += " " + curr
+        else:
+            res += curr
+    return res.strip()
 
 
 def get_best_device():
@@ -179,10 +384,11 @@ def build_demo(
         preprocess_prompt,
         postprocess_output,
         mode,
+        generate_srt=True,
         ref_text=None,
     ):
         if not text or not text.strip():
-            return None, "Please enter the text to synthesize."
+            return None, "", None, "Please enter the text to synthesize."
 
         gen_config = OmniVoiceGenerationConfig(
             num_step=int(num_step or 32),
@@ -205,7 +411,7 @@ def build_demo(
 
         if mode == "clone":
             if not ref_audio:
-                return None, "Please upload a reference audio."
+                return None, "", None, "Please upload a reference audio."
             kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
                 ref_audio=ref_audio,
                 ref_text=ref_text,
@@ -217,10 +423,33 @@ def build_demo(
         try:
             audio = model.generate(**kw)
         except Exception as e:
-            return None, f"Error: {type(e).__name__}: {e}"
+            return None, "", None, f"Error: {type(e).__name__}: {e}"
 
         waveform = (audio[0] * 32767).astype(np.int16)
-        return (sampling_rate, waveform), "Done."
+        audio_tuple = (sampling_rate, waveform)
+
+        # Generate slug for filenames
+        slug = get_slug(text)
+        temp_dir = tempfile.mkdtemp()
+        audio_path = os.path.join(temp_dir, f"{slug}.wav")
+        sf.write(audio_path, waveform, sampling_rate)
+
+        srt_content = ""
+        download_path = audio_path
+
+        if generate_srt:
+            srt_content = text_to_srt_with_timestamps(text, audio_tuple, language=lang)
+            # Create a zip file containing both audio and srt
+            zip_path = os.path.join(temp_dir, f"{slug}.zip")
+            with zipfile.ZipFile(zip_path, "w") as zipf:
+                zipf.write(audio_path, arcname=f"{slug}.wav")
+                srt_path = os.path.join(temp_dir, f"{slug}.srt")
+                with open(srt_path, "w", encoding="utf-8") as f:
+                    f.write(srt_content)
+                zipf.write(srt_path, arcname=f"{slug}.srt")
+            download_path = zip_path
+
+        return audio_path, srt_content, download_path, "Done."
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
@@ -347,6 +576,11 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             " to auto-transcribe via ASR models.",
                         )
                         vc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
+                        vc_gen_srt = gr.Checkbox(
+                            label="Generate Subtitles (SRT) / 生成字幕",
+                            value=True,
+                            info="If enabled, audio and SRT will be packed in a ZIP file.",
+                        )
                         with gr.Accordion("Instruct (optional)", open=False):
                             vc_instruct = gr.Textbox(label="Instruct", lines=2)
                         (
@@ -362,12 +596,33 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                     with gr.Column(scale=1):
                         vc_audio = gr.Audio(
                             label="Output Audio / 合成结果",
-                            type="numpy",
+                            type="filepath",
+                        )
+                        vc_srt = gr.Textbox(
+                            label="Subtitle (SRT) - Aligned from your input text",
+                            lines=12,
+                            show_copy_button=True,
+                            interactive=False,
+                        )
+                        vc_download = gr.DownloadButton(
+                            "📥 Download Results (Audio + SRT)", visible=False
                         )
                         vc_status = gr.Textbox(label="Status / 状态", lines=2)
 
                 def _clone_fn(
-                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
+                    text,
+                    lang,
+                    ref_aud,
+                    ref_text,
+                    instruct,
+                    ns,
+                    gs,
+                    dn,
+                    sp,
+                    du,
+                    pp,
+                    po,
+                    gen_srt,
                 ):
                     return _gen(
                         text,
@@ -382,6 +637,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         pp,
                         po,
                         mode="clone",
+                        generate_srt=gen_srt,
                         ref_text=ref_text or None,
                     )
 
@@ -400,8 +656,13 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vc_du,
                         vc_pp,
                         vc_po,
+                        vc_gen_srt,
                     ],
-                    outputs=[vc_audio, vc_status],
+                    outputs=[vc_audio, vc_srt, vc_download, vc_status],
+                ).then(
+                    lambda dl: gr.update(visible=True, value=dl),
+                    inputs=[vc_download],
+                    outputs=[vc_download],
                 )
 
             # ==============================================================
@@ -416,6 +677,11 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             placeholder="Enter the text you want to synthesize...",
                         )
                         vd_lang = _lang_dropdown()
+                        vd_gen_srt = gr.Checkbox(
+                            label="Generate Subtitles (SRT) / 生成字幕",
+                            value=True,
+                            info="If enabled, audio and SRT will be packed in a ZIP file.",
+                        )
 
                         _AUTO = "Auto"
                         vd_groups = []
@@ -442,7 +708,16 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                     with gr.Column(scale=1):
                         vd_audio = gr.Audio(
                             label="Output Audio / 合成结果",
-                            type="numpy",
+                            type="filepath",
+                        )
+                        vd_srt = gr.Textbox(
+                            label="Subtitle (SRT) - Aligned from your input text",
+                            lines=12,
+                            show_copy_button=True,
+                            interactive=False,
+                        )
+                        vd_download = gr.DownloadButton(
+                            "📥 Download Results (Audio + SRT)", visible=False
                         )
                         vd_status = gr.Textbox(label="Status / 状态", lines=2)
 
@@ -468,7 +743,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, *groups):
+                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, gen_srt, *groups):
                     return _gen(
                         text,
                         lang,
@@ -482,6 +757,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         pp,
                         po,
                         mode="design",
+                        generate_srt=gen_srt,
                     )
 
                 vd_btn.click(
@@ -496,9 +772,14 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vd_du,
                         vd_pp,
                         vd_po,
+                        vd_gen_srt,
                     ]
                     + vd_groups,
-                    outputs=[vd_audio, vd_status],
+                    outputs=[vd_audio, vd_srt, vd_download, vd_status],
+                ).then(
+                    lambda dl: gr.update(visible=True, value=dl),
+                    inputs=[vd_download],
+                    outputs=[vd_download],
                 )
 
     return demo
