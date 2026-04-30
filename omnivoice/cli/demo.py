@@ -194,12 +194,23 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
         tokenizer = ALIGN_BUNDLE.get_tokenizer()
         aligner = ALIGN_BUNDLE.get_aligner()
         
+        # We use Pinyin for Mandarin to ensure the MMS tokenizer can read it
+        try:
+            from pypinyin import pinyin, Style
+            def romanize_text(t):
+                return " ".join([item[0] for item in pinyin(t, style=Style.NORMAL)])
+        except ImportError:
+            # Fallback if pypinyin is missing
+            def romanize_text(t): return t
+        
         all_tokens = []
         segment_token_counts = []
         
         for seg in segments:
+            # Romanize for CJK support (Mandarin)
+            roman_seg = romanize_text(seg)
             # Clean and split into words to avoid space character issues
-            words = re.sub(r'[^\w\s\u4e00-\u9fff]', '', seg).lower().split()
+            words = re.sub(r'[^a-zA-Z0-9\s]', '', roman_seg).lower().split()
             seg_tokens = []
             for w in words:
                 w_t = tokenizer(w)
