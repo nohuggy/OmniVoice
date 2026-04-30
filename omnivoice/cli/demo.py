@@ -29,15 +29,23 @@ import os
 import re
 import tempfile
 import zipfile
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import gradio as gr
 import numpy as np
 import soundfile as sf
 import torch
+import torchaudio
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
+
+# For torchaudio alignment
+try:
+    from torchaudio.pipelines import MMS_FA as ALIGN_BUNDLE
+    ALIGN_MODEL = None  # Lazy load
+except ImportError:
+    ALIGN_BUNDLE = None
 
 
 def smart_split(text, language="eng"):
@@ -141,81 +149,114 @@ def smart_split(text, language="eng"):
 
 
 def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
-    """Generate SRT using forced alignment with the exact input text"""
+    """
+    Generate SRT subtitle content using torchaudio forced alignment.
+    This replaces the unreliable aeneas library for better compatibility.
+    """
     if not text or audio_tuple is None:
         return "No text or audio to align."
+    
+    if not ALIGN_BUNDLE:
+        return f"Alignment error: torchaudio alignment bundle not available.\n\nFalling back to plain text:\n{text}"
 
-    sr, waveform = audio_tuple
-
-    # Save audio temporarily as WAV (aeneas prefers WAV)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_audio:
-        # waveform is usually int16 here based on _gen_core
-        sf.write(f_audio.name, waveform.astype(np.float32) / 32767.0, sr)
-        audio_path = f_audio.name
-
-    # Prepare output SRT path
-    fd, srt_path = tempfile.mkstemp(suffix=".srt")
-    os.close(fd)
-
-    # Map common codes to aeneas 3-letter codes
-    lang_map = {
-        "en": "eng",
-        "english": "eng",
-        "zh": "cmn",
-        "chinese": "cmn",
-        "mandarin": "cmn",
-        "ja": "jpn",
-        "japanese": "jpn",
-        "ko": "kor",
-        "korean": "kor",
-    }
-    aeneas_lang = lang_map.get(
-        language.lower() if language else "eng",
-        (language.lower()[:3] if language and len(language) >= 3 else "eng"),
-    )
-
-    # Smart Split the text
-    segments = smart_split(text, language)
-    if not segments:
-        return "No text segments to align."
-
-    # Prepare text file for aeneas (one segment per line)
-    with tempfile.NamedTemporaryFile(
-        suffix=".txt", delete=False, mode="w", encoding="utf-8"
-    ) as f_text:
-        f_text.write("\n".join(segments))
-        text_path = f_text.name
-
+    global ALIGN_MODEL
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     try:
-        from aeneas.executetask import ExecuteTask
-        from aeneas.task import Task
+        # 1. Load model (Lazy load Meta MMS Aligner)
+        if ALIGN_MODEL is None:
+            ALIGN_MODEL = ALIGN_BUNDLE.get_model().to(device)
+        
+        sr, audio_arr = audio_tuple
+        # Ensure audio is float32 for alignment
+        if audio_arr.dtype == np.int16:
+            audio_arr = audio_arr.astype(np.float32) / 32767.0
+        
+        audio_tensor = torch.from_numpy(audio_arr).float()
+        if len(audio_tensor.shape) == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        elif audio_tensor.shape[0] > 1:
+            audio_tensor = audio_tensor.mean(dim=0, keepdim=True)
+        
+        # MMS_FA expects 16kHz
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(sr, 16000)
+            audio_tensor = resampler(audio_tensor)
+        
+        audio_tensor = audio_tensor.to(device)
+        
+        # 2. Get segments using our smart_split
+        segments = smart_split(text, language)
+        if not segments:
+            return text
+            
+        # 3. Align the full text
+        # MMS_FA tokenizer handles multiple languages (English, Chinese, etc.)
+        clean_text = re.sub(r'[^\w\s\u4e00-\u9fff]', '', text).lower()
+        tokenizer = ALIGN_BUNDLE.get_tokenizer()
+        aligner = ALIGN_BUNDLE.get_aligner()
+        
+        tokens = tokenizer(clean_text)
+        if not tokens:
+             return text
+             
+        with torch.inference_mode():
+            emission, _ = ALIGN_MODEL(audio_tensor)
+            token_spans = aligner(emission[0], tokens)
+        
+        if not token_spans:
+            return text
+            
+        # Frame-to-Second mapping
+        num_frames = emission.shape[1]
+        total_duration = len(audio_arr) / sr
+        frame_to_sec = total_duration / num_frames
+        
+        # 4. Map tokens to segments
+        srt_lines = []
+        token_ptr = 0
+        
+        for i, seg in enumerate(segments):
+            # Clean segment text for token matching
+            seg_clean = re.sub(r'[^\w\s\u4e00-\u9fff]', '', seg).lower().strip()
+            seg_tokens = tokenizer(seg_clean)
+            if not seg_tokens:
+                continue
+            
+            # Find the start and end tokens for this segment
+            start_token_idx = token_ptr
+            end_token_idx = min(token_ptr + len(seg_tokens), len(token_spans))
+            
+            if start_token_idx < len(token_spans):
+                start_frame = token_spans[start_token_idx].start
+                end_frame = token_spans[min(end_token_idx - 1, len(token_spans) - 1)].end
+                
+                start_time = start_frame * frame_to_sec
+                end_time = end_frame * frame_to_sec
+                
+                # Ensure timing doesn't overlap backwards
+                if srt_lines and start_time < srt_lines[-1][2]:
+                    start_time = srt_lines[-1][2]
+                
+                srt_lines.append((i + 1, start_time, end_time, seg))
+                token_ptr = end_token_idx
 
-        config_string = (
-            f"task_language={aeneas_lang}|is_text_type=plain|os_task_file_format=srt|"
-            "task_adjust_boundary_nonspeech_tolerance=0.2|task_adjust_boundary_threshold=0.1"
-        )
-        task = Task(config_string=config_string)
-        task.audio_file_path_absolute = audio_path
-        task.text_file_path_absolute = text_path
-        task.sync_map_file_path_absolute = srt_path
+        # Format as SRT
+        def format_time(seconds):
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            s = int(seconds % 60)
+            ms = int((seconds % 1) * 1000)
+            return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
-        # Run forced alignment
-        ExecuteTask(task).execute()
-        task.output_sync_map_file()
-
-        with open(srt_path, "r", encoding="utf-8") as f:
-            srt_content = f.read()
-
-        return srt_content.strip()
+        res = ""
+        for idx, start, end, t in srt_lines:
+            res += f"{idx}\n{format_time(start)} --> {format_time(end)}\n{t}\n\n"
+            
+        return res.strip() if res else text
 
     except Exception as e:
         return f"Alignment error: {str(e)}\n\nFalling back to plain text:\n{text}"
-
-    finally:
-        # Cleanup temp files
-        for path in [audio_path, text_path, srt_path]:
-            if os.path.exists(path):
-                os.unlink(path)
 
 
 def get_slug(text, max_tokens=8):
