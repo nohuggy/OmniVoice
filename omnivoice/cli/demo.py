@@ -190,19 +190,32 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
         if not segments:
             return text
             
-        # 3. Align the full text
-        # MMS_FA tokenizer handles multiple languages (English, Chinese, etc.)
-        clean_text = re.sub(r'[^\w\s\u4e00-\u9fff]', '', text).lower()
+        # 3. Tokenize text segment-by-segment to track token counts
         tokenizer = ALIGN_BUNDLE.get_tokenizer()
         aligner = ALIGN_BUNDLE.get_aligner()
         
-        tokens = tokenizer(clean_text)
-        if not tokens:
+        all_tokens = []
+        segment_token_counts = []
+        
+        for seg in segments:
+            # Clean and split into words to avoid space character issues
+            words = re.sub(r'[^\w\s\u4e00-\u9fff]', '', seg).lower().split()
+            seg_tokens = []
+            for w in words:
+                w_t = tokenizer(w)
+                if w_t:
+                    seg_tokens.extend(w_t)
+            
+            all_tokens.extend(seg_tokens)
+            segment_token_counts.append(len(seg_tokens))
+        
+        if not all_tokens:
              return text
              
+        # 4. Run Alignment
         with torch.inference_mode():
             emission, _ = ALIGN_MODEL(audio_tensor)
-            token_spans = aligner(emission[0], tokens)
+            token_spans = aligner(emission[0], all_tokens)
         
         if not token_spans:
             return text
@@ -212,24 +225,22 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
         total_duration = len(audio_arr) / sr
         frame_to_sec = total_duration / num_frames
         
-        # 4. Map tokens to segments
+        # 5. Map spans back to segments
         srt_lines = []
-        token_ptr = 0
+        token_offset = 0
         
-        for i, seg in enumerate(segments):
-            # Clean segment text for token matching
-            seg_clean = re.sub(r'[^\w\s\u4e00-\u9fff]', '', seg).lower().strip()
-            seg_tokens = tokenizer(seg_clean)
-            if not seg_tokens:
+        for i, (seg, count) in enumerate(zip(segments, segment_token_counts)):
+            if count == 0:
                 continue
-            
-            # Find the start and end tokens for this segment
-            start_token_idx = token_ptr
-            end_token_idx = min(token_ptr + len(seg_tokens), len(token_spans))
+                
+            start_token_idx = token_offset
+            end_token_idx = token_offset + count
             
             if start_token_idx < len(token_spans):
+                # We use the start of the first token and end of the last token in the segment
                 start_frame = token_spans[start_token_idx].start
-                end_frame = token_spans[min(end_token_idx - 1, len(token_spans) - 1)].end
+                actual_end_idx = min(end_token_idx - 1, len(token_spans) - 1)
+                end_frame = token_spans[actual_end_idx].end
                 
                 start_time = start_frame * frame_to_sec
                 end_time = end_frame * frame_to_sec
@@ -239,7 +250,8 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
                     start_time = srt_lines[-1][2]
                 
                 srt_lines.append((i + 1, start_time, end_time, seg))
-                token_ptr = end_token_idx
+            
+            token_offset += count
 
         # Format as SRT
         def format_time(seconds):
