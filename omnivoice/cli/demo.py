@@ -229,6 +229,12 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
         srt_lines = []
         token_offset = 0
         
+        def get_val(obj, attr):
+            # Recursively drill down into nested lists to find the span attribute
+            while isinstance(obj, list) and len(obj) > 0:
+                obj = obj[0] if attr == 'start' else obj[-1]
+            return getattr(obj, attr, 0)
+
         for i, (seg, count) in enumerate(zip(segments, segment_token_counts)):
             if count == 0:
                 continue
@@ -237,10 +243,10 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
             end_token_idx = token_offset + count
             
             if start_token_idx < len(token_spans):
-                # We use the start of the first token and end of the last token in the segment
-                start_frame = token_spans[start_token_idx].start
+                # Use the recursive helper to avoid 'list' attribute errors
+                start_frame = get_val(token_spans[start_token_idx], 'start')
                 actual_end_idx = min(end_token_idx - 1, len(token_spans) - 1)
-                end_frame = token_spans[actual_end_idx].end
+                end_frame = get_val(token_spans[actual_end_idx], 'end')
                 
                 start_time = start_frame * frame_to_sec
                 end_time = end_frame * frame_to_sec
