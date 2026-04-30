@@ -226,13 +226,22 @@ def text_to_srt_with_timestamps(text: str, audio_tuple, language="eng") -> str:
         # 4. Run Alignment
         with torch.inference_mode():
             emission, _ = ALIGN_MODEL(audio_tensor)
-            token_spans = aligner(emission[0], all_tokens)
+            
+            # STABILITY FIX: Move emission to CPU for the aligner logic.
+            # torchaudio alignment can hang on some GPU/Driver combinations.
+            emission_cpu = emission[0].cpu()
+            
+            # Check for empty emission (audio too short)
+            if emission_cpu.shape[0] == 0:
+                return text
+                
+            token_spans = aligner(emission_cpu, all_tokens)
         
         if not token_spans:
             return text
             
         # Frame-to-Second mapping
-        num_frames = emission.shape[1]
+        num_frames = emission_cpu.shape[0]
         total_duration = len(audio_arr) / sr
         frame_to_sec = total_duration / num_frames
         
